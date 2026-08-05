@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Private runtime state and local data
+soultide.db
+*.db
+logs/
+captures/
+analysis/
+offline_cdn/
+backups/
+dependencies/
+
+# Client and signing material
+*.apk
+*.idsig
+*.keystore
+apk_output/
+apk_build/
+launcher_output/
+python-*.exe
+
+# Local machine configuration
+.env
+*.local.*
+update_mode.json
+dns_port.txt

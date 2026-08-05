@@ -1,0 +1,9 @@
+# Soul Tide Local Server - Python dependencies
+# Install: pip install -r requirements.txt
+
+# HTTP server (login_server.py)
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+
+# HTTP proxy for upstream diagnostics (optional, only with ALLOW_UPSTREAM=1)
+httpx>=0.24.0
