@@ -61,7 +61,7 @@ HOME_CONFIG = _load_local_snapshot(
     "homeland_config_5392.json",
     {
         "rooms": {}, "plantGrids": {}, "decorates": {}, "decorateSuits": {},
-        "homePlotDialogCids": [], "referencedConditions": {},
+        "homePlotDialogs": {}, "homePlotDialogCids": [], "referencedConditions": {},
     },
 )
 TOWN_CONFIG = _load_local_snapshot(
@@ -3161,30 +3161,56 @@ def handle_home_visit(session, uid, body):
 
 def handle_home_trigger_plot(session, uid, body):
     try:
-        (plot_id,) = protocol_codec.decode_method(1810, body)
+        (action_id,) = protocol_codec.decode_method(1810, body)
     except (ValueError, KeyError):
         return False
-    plot_id = int(plot_id)
-    if plot_id <= 0:
+    action_id = int(action_id)
+    if action_id <= 0:
         return False
-    valid_plot_ids = {
+    plot_dialogs = {
+        int(key): _int(value, 0)
+        for key, value in (HOME_CONFIG.get("homePlotDialogs") or {}).items()
+        if _int(key, 0) > 0 and _int(value, 0) > 0
+    }
+    dialog_id = plot_dialogs.get(action_id)
+    if dialog_id is None:
+        # Older local snapshots exposed only dialog IDs. Keep accepting that
+        # legacy shape during rollout, while all current clients use action IDs.
+        legacy_dialog_ids = {
         int(value) for value in HOME_CONFIG.get("homePlotDialogCids", [])
         if _int(value, 0) > 0
-    }
-    if valid_plot_ids and plot_id not in valid_plot_ids:
+        }
+        if action_id not in legacy_dialog_ids:
+            return False
+        dialog_id = action_id
+    if dialog_id <= 0:
         return False
     data = _init_state(uid, "home", HOME_DEFAULTS)
     plots = _safe_positive_int_list(data.get("plots"))
     data["plots"] = plots
-    if plot_id in set(plots):
+    if action_id in set(plots):
         # Type=1 homeland bubbles are one-shot. Type=2 new-story bubbles do
         # not reach this handler and continue through the 3402 story chain.
-        session.send(1842, protocol_codec.encode_method(1842, 1, plot_id))
+        session.send(1842, protocol_codec.encode_method(1842, 1, action_id))
         return True
-    plots.append(plot_id)
+    if getattr(session, "active_story", None) is not None:
+        return False
+    plots.append(action_id)
     if not _save(uid, "home", data):
         return False
-    session.send(1842, protocol_codec.encode_method(1842, 0, plot_id))
+    session.active_story = {
+        "kind": "home",
+        "plot_id": action_id,
+        "dialog_cid": dialog_id,
+    }
+    session.send(1842, protocol_codec.encode_method(1842, 0, action_id))
+    session.send(1604, protocol_codec.encode_method(1604, dialog_id))
+    log.info(
+        "  home plot opened uid=%s actionId=%d dialogCid=%d -> 1842/1604",
+        uid,
+        action_id,
+        dialog_id,
+    )
     return True
 
 

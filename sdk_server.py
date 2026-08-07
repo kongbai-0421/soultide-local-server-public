@@ -15,7 +15,14 @@ ROOT = os.environ.get("SOULTIDE_ROOT", os.path.dirname(os.path.abspath(__file__)
 LOCAL_UID = os.environ.get("SOULTIDE_LOCAL_UID", "local_uid_12345")
 LOCAL_USERNAME = os.environ.get("SOULTIDE_LOCAL_USERNAME", "local_player")
 LOCAL_TOKEN = "local_token_" + hashlib.md5(LOCAL_UID.encode("ascii")).hexdigest()
-SERVER_IP = os.environ.get("SOULTIDE_SERVER_IP", "192.168.1.136")
+SERVER_IP = os.environ.get(
+    "SOULTIDE_SERVER_IP",
+    "127.0.0.1" if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else "192.168.1.136",
+)
+_BIND_HOST = os.environ.get(
+    "SOULTIDE_BIND_HOST",
+    "127.0.0.1" if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else "0.0.0.0",
+).strip()
 PAYMENT_MODE = os.environ.get("SOULTIDE_PAYMENT_MODE", "local").strip().lower()
 
 logging.basicConfig(
@@ -240,4 +247,4 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     port = int(os.environ.get("SOULTIDE_SDK_PORT", "8000"))
     log.info("SDK server starting on 0.0.0.0:%d (fully local)", port)
-    http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    http.server.ThreadingHTTPServer((_BIND_HOST, port), Handler).serve_forever()

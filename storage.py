@@ -19,10 +19,13 @@ DEFAULT_ROLE_ID = "5056536390159161419"
 DEFAULT_ROLE_NAME = "x空白x"
 DEFAULT_ROLE_LEVEL = 70
 
-# Public builds do not contain a real account mapping. Deployments may provide
-# their own mapping through a private runtime patch or database provisioning
-# step; no personal or captured account identity belongs in this repository.
-DEFAULT_ACCOUNT_ALIASES = {}
+# The real Bilibili channel identity observed on the preserved MuMu account must
+# resolve to the existing offline player instead of manufacturing a fresh MD5
+# account.  Keep the account row and all of its child data unchanged; aliases
+# are a separate compatibility layer.
+DEFAULT_ACCOUNT_ALIASES = {
+    "3461578108176596": "15dcba9291fef1f76a3288c01121a1b4",
+}
 
 
 # The client distinguishes numeric attributes (Type=6) from warehouse

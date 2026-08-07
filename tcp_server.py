@@ -33,6 +33,10 @@ OFFLINE_RESPONSE_FIXTURE_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis", "tcp_offline_responses.json"),
 )
 TCP_PORT = int(os.environ.get("SOULTIDE_TCP_PORT", "51121"))
+_BIND_HOST = os.environ.get(
+    "SOULTIDE_BIND_HOST",
+    "127.0.0.1" if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else "0.0.0.0",
+).strip()
 STORY_CONFIG_PATH = os.environ.get(
     "SOULTIDE_STORY_CONFIG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "soul_new_story_config.json"),
@@ -74,6 +78,15 @@ LOTTERY_DROP_CONFIG_PATH = os.environ.get(
 BATTLE_CONFIG_PATH = os.environ.get(
     "SOULTIDE_BATTLE_CONFIG_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis", "battle_config.json"),
+)
+WORLD_BOSS_CONFIG_PATH = os.environ.get(
+    "SOULTIDE_WORLD_BOSS_CONFIG_PATH",
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "analysis",
+        "decompiled_all",
+        "textasset_00456_CfgWorldBossTable.lua.bi",
+    ),
 )
 MODULE_CONFIG_PATH = os.environ.get(
     "SOULTIDE_MODULE_CONFIG_PATH",
@@ -716,6 +729,29 @@ except Exception as exc:
     LOTTERY_DROP_CONFIG = {}
     log.warning("Lottery drop config is unavailable: %s", exc)
 
+
+def _load_world_boss_config(path):
+    """Read BossId -> MonsterTeam from the extracted official Lua table."""
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            source = file.read()
+    except OSError as exc:
+        log.warning("World Boss config is unavailable: %s", exc)
+        return {}
+    # Every keyed row starts with MonsterTeam, so matching the row prefix
+    # avoids parsing nested reward arrays while retaining the official IDs.
+    rows = re.findall(
+        r"\[(\d+)\]\s*=\s*\{\s*MonsterTeam\s*=\s*(\d+)",
+        source,
+        flags=re.MULTILINE,
+    )
+    result = {str(int(boss_id)): {"MonsterTeam": int(team_id)} for boss_id, team_id in rows}
+    log.info("Loaded World Boss config: %d bosses", len(result))
+    return result
+
+
+WORLD_BOSS_CONFIG = _load_world_boss_config(WORLD_BOSS_CONFIG_PATH)
+
 try:
     with open(BATTLE_CONFIG_PATH, "r", encoding="utf-8") as file:
         BATTLE_CONFIG = json.load(file)
@@ -840,19 +876,26 @@ LOCAL_BATTLE_ENTRY_TYPES = {
 GIFT_FAVOR_MULTIPLIERS = (100, 170, 200, 200, 200, 100, 100, 170, 170, 170, 140, 140)
 
 
-def favor_level_for(soul_id, favor):
-    rows = [
-        row
-        for row in COMPANION_RULES.get("soul_favor", {}).values()
-        if row.get("SoulID") == soul_id
-        and isinstance(row.get("FavorValue"), int)
-        and isinstance(row.get("FavorDegree"), int)
-    ]
-    rows.sort(key=lambda row: row["FavorValue"], reverse=True)
-    for row in rows:
-        if row["FavorValue"] <= favor:
-            return row["FavorDegree"]
-    return 1
+def favor_level_for(soul_id, favor, oath_activated=False):
+    level = 1
+    threshold = 0
+    for row in sorted(
+        (
+            row
+            for row in COMPANION_RULES.get("soul_favor", {}).values()
+            if row.get("SoulID") == soul_id
+        ),
+        key=lambda row: int(row.get("FavorDegree", 0) or 0),
+    ):
+        degree = int(row.get("FavorDegree", 0) or 0)
+        if degree < 1 or degree > (50 if oath_activated else 40):
+            continue
+        value = row.get("FavorValue")
+        if isinstance(value, int):
+            threshold = value
+        if threshold <= favor:
+            level = degree
+    return level
 
 
 def fondle_action_for(soul_id, favor_level):
@@ -1204,20 +1247,20 @@ def local_soul_pod_for(uid, soul_id, base=None, companion=None):
         or int(direct_quality_row.get("SoulId", 0) or 0) != int(soul_id)
     ):
         quality_id = int(quality_row.get("Id", quality_id) or quality_id)
+    oath_activated = bool(companion.get("oath_activation", 0))
+    favor_level = int(companion.get("favor_level", 1))
+    if not oath_activated and favor_level > 40:
+        favor_level = 40
     pod.update({
         "cid": int(soul_id),
         "lv": int(companion.get("level", 1)),
         "exp": int(progress.get("exp", pod.get("exp", 0)) or 0),
         "favor": int(companion.get("favor", 0)),
-        "favorLv": int(companion.get("favor_level", 1)),
-        "favorMaxLv": max(
-            1,
-            int(pod.get("favorMaxLv", companion.get("favor_level", 1)) or 1),
-            int(companion.get("favor_level", 1) or 1),
-        ),
+        "favorLv": favor_level,
+        "favorMaxLv": 50 if oath_activated else 40,
         "qualityId": max(1, quality_id),
         "dailyDislike": bool(companion.get("daily_dislike", 0)),
-        "oathActivation": bool(companion.get("oath_activation", 0)),
+        "oathActivation": oath_activated,
         "mood": int(pod.get("mood", 150) or 0),
         "moodTimeInterval": int(pod.get("moodTimeInterval", 0) or 0),
         "workStatus": int(pod.get("workStatus", 0) or 0),
@@ -2922,7 +2965,11 @@ class Session:
         companion = storage.get_companion(self.uid, soul_id)
         if companion is None:
             return False
-        new_level = favor_level_for(soul_id, companion["favor"] + add_favor)
+        new_level = favor_level_for(
+            soul_id,
+            companion["favor"] + add_favor,
+            bool(companion["oath_activation"]),
+        )
         result = storage.apply_gift(
             self.uid,
             soul_id,
@@ -3108,7 +3155,11 @@ class Session:
             log.warning("  fondle rejected: no action rule soulCid=%d favorLv=%d", soul_id, companion["favor_level"])
             return False
         add_favor = 100
-        new_level = favor_level_for(soul_id, companion["favor"] + add_favor)
+        new_level = favor_level_for(
+            soul_id,
+            companion["favor"] + add_favor,
+            bool(companion["oath_activation"]),
+        )
         result = storage.apply_fondle(
             self.uid,
             soul_id,
@@ -5402,18 +5453,39 @@ class Session:
             log.warning("  local battle entry rejected: invalid body uid=%s msgId=%s", self.uid, request_id)
             return False
 
-        numbers = []
-        for value in values:
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int) and value > 0:
-                numbers.append(value)
-        map_id = numbers[0] if numbers else 0
-        configured_teams = BATTLE_CONFIG.get("teams", {})
-        monster_team_id = next(
-            (value for value in numbers[1:] if str(value) in configured_teams),
-            0,
-        )
+        if request_id == 3202:
+            # net_worldBoss.attack(dupCid, formationId, clearCD, bossCid)
+            # has no monster-team ID in its request.  The previous generic
+            # parser treated the message ID/dup fields as battle data and
+            # created a FightPOD with an empty defender.
+            try:
+                dup_cid, _formation_id, _clear_cd, boss_cid = values
+                world_boss = WORLD_BOSS_CONFIG.get(str(int(boss_cid)))
+                monster_team_id = int(world_boss["MonsterTeam"]) if world_boss else 0
+                map_id = int(dup_cid)
+            except (TypeError, ValueError, KeyError, IndexError):
+                log.warning("  world boss entry rejected: malformed values uid=%s values=%r", self.uid, values)
+                return False
+            if not monster_team_id:
+                log.warning(
+                    "  world boss entry rejected: unknown bossCid uid=%s bossCid=%s",
+                    self.uid,
+                    boss_cid,
+                )
+                return False
+        else:
+            numbers = []
+            for value in values:
+                if isinstance(value, bool):
+                    continue
+                if isinstance(value, int) and value > 0:
+                    numbers.append(value)
+            map_id = numbers[0] if numbers else 0
+            configured_teams = BATTLE_CONFIG.get("teams", {})
+            monster_team_id = next(
+                (value for value in numbers[1:] if str(value) in configured_teams),
+                0,
+            )
         if not self._send_notify_start_fight(
             battle_type=battle_type, map_id=map_id, monster_team_id=monster_team_id
         ):
@@ -5582,6 +5654,17 @@ class Session:
         fight_pod = self._make_fight_pod(
             battle_id, battle_type, map_id, monster_team_id, battle["random_seed"]
         )
+        defender = fight_pod.get("Defender", {}).get("ArrFightUnitPOD", [])
+        if battle_type == 3 and not defender:
+            storage.abandon_active_battles(self.uid, map_id)
+            log.warning(
+                "  notifyStartFight rejected: empty defender uid=%s battleType=%d mapId=%d team=%d",
+                self.uid,
+                battle_type,
+                map_id,
+                monster_team_id,
+            )
+            return False
         if not storage.set_battle_server_snapshot(self.uid, battle_id, fight_pod):
             log.warning("  notifyStartFight rejected: unable to persist server snapshot uid=%s battleId=%s", self.uid, battle_id)
             return False
@@ -6103,7 +6186,12 @@ class Session:
         cost_values = event.get("Cost", [])
         costs = list(zip(cost_values[::2], cost_values[1::2]))
         end_favor = dating["begin_favor"] + favor_delta
-        end_level = favor_level_for(dating["soul_id"], end_favor)
+        local_companion = storage.get_companion(self.uid, dating["soul_id"])
+        end_level = favor_level_for(
+            dating["soul_id"],
+            end_favor,
+            bool(local_companion["oath_activation"]),
+        )
         if not storage.apply_companion_operation(
             self.uid,
             dating["soul_id"],
@@ -6238,6 +6326,25 @@ class Session:
                 select_index,
                 skip_indexes,
             )
+
+        if self.active_story.get("kind") == "home":
+            story = self.active_story
+            # Homeland plot dialogs are one-shot, non-reward dialogs. The
+            # action was persisted when it opened; this packet only closes
+            # the client dialog and releases the session interaction lock.
+            self.send(SELECT_DIALOG_RESULT, protocol_codec.encode_method(1603, 0, -1))
+            log.info(
+                "  home plot completed uid=%s actionId=%d dialogCid=%d "
+                "selectIndex=%d skipped=%s -> %d",
+                self.uid,
+                int(story.get("plot_id", 0)),
+                int(story.get("dialog_cid", 0)),
+                select_index,
+                skip_indexes,
+                SELECT_DIALOG_RESULT,
+            )
+            self.active_story = None
+            return True
 
         story = self.active_story
         result_body = b"\x50" + encode_signed_protocol_int(-1)
@@ -6589,7 +6696,7 @@ class Session:
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", TCP_PORT))
+    server.bind((_BIND_HOST, TCP_PORT))
     server.listen(10)
     log.info("=" * 50)
     log.info("Soul Tide TCP Game Server v4")

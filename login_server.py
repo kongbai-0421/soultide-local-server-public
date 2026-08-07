@@ -50,11 +50,14 @@ else:
         LOCAL_MANIFEST = _nonfull_manifest
     else:
         LOCAL_MANIFEST = ASSET_ROOT / "version-local.json"
-ALLOW_UPSTREAM = os.environ.get("SOULTIDE_ALLOW_UPSTREAM", "0") == "1"
+ALLOW_UPSTREAM = (
+    os.environ.get("SOULTIDE_ALLOW_UPSTREAM", "0") == "1"
+    and os.environ.get("SOULTIDE_MOBILE_MODE", "0") != "1"
+)
 CDN_UPSTREAM_FALLBACK = os.environ.get(
     "SOULTIDE_CDN_UPSTREAM_FALLBACK",
     "1" if ALLOW_UPSTREAM else "0",
-) == "1"
+) == "1" and ALLOW_UPSTREAM
 CDN_UPSTREAM_ROOT = os.environ.get(
     "SOULTIDE_CDN_UPSTREAM_ROOT",
     "http://cdn-onigao-1.iqigame.com/Onigao/Update/resources",
@@ -69,9 +72,16 @@ UPSTREAM_PROXY = os.environ.get(
     "",
 ).strip() or None
 HTTP_PORT = int(os.environ.get("SOULTIDE_HTTP_PORT", "8081"))
+_BIND_HOST = os.environ.get(
+    "SOULTIDE_BIND_HOST",
+    "127.0.0.1" if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else "0.0.0.0",
+).strip()
 
 CONFIG = {
-    "server_ip": os.environ.get("SOULTIDE_SERVER_IP", "192.168.1.136"),
+    "server_ip": os.environ.get(
+        "SOULTIDE_SERVER_IP",
+        "127.0.0.1" if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else "192.168.1.136",
+    ),
     "tcp_port": int(os.environ.get("SOULTIDE_TCP_PORT", "51121")),
     "server_id": "1121",
     "area_id": "101",
@@ -699,4 +709,4 @@ if __name__ == "__main__":
     log.info("TCP target: %s:%s", CONFIG["server_ip"], CONFIG["tcp_port"])
     log.info("Local CDN: %s (%d files)", ASSET_ROOT, manifest_count)
     log.info("Local manifest: %s", LOCAL_MANIFEST)
-    uvicorn.run(app, host="0.0.0.0", port=HTTP_PORT, log_level="info")
+    uvicorn.run(app, host=_BIND_HOST, port=HTTP_PORT, log_level="info")
