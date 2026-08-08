@@ -11,3 +11,9 @@ runtime inputs in a private build environment.
 
 The Java listener is bound only to `127.0.0.1`; it is not an Internet service
 and must not be exposed to a network.
+
+On physical phones, Android vendor power managers may reclaim the service after
+the game is brought to the foreground. Keep the service app visible in a small
+window or split-screen while playing, lock it in recent tasks, allow
+autostart/background activity, disable battery optimization, and keep its
+foreground notification enabled. This is generally unnecessary on emulators.
