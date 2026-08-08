@@ -26,7 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DB = ROOT / "soultide.db"
 SNAPSHOT_KIND = "soultide-account-snapshot"
 SNAPSHOT_VERSION = 1
+ACCOUNT_ARTIFACT_KIND = "soultide-account-file"
+ACCOUNT_ARTIFACT_VERSION = 1
 UID_TOKEN = "__SOURCE_UID__"
+WHISPER_LIST_FIELD = "unlockSoulWhispers"
+WHISPER_STATE_FIELD = "soulWhisperUnlocks"
 
 # Keep this list explicit.  A generic "every table containing uid" export
 # would accidentally include sessions, aliases, or cross-account guild state.
@@ -162,6 +166,72 @@ def sanitize_row(row: dict[str, Any], replacements: dict[str, str]) -> dict[str,
     return {key: sanitize_value(value, replacements) for key, value in row.items()}
 
 
+def whisper_ids(value: Any) -> set[int]:
+    """Read both official PlayerPOD and local whisper-state formats."""
+    if isinstance(value, dict):
+        value = value.get("whisperIds", [])
+    if not isinstance(value, list):
+        return set()
+    result: set[int] = set()
+    for item in value:
+        try:
+            item = int(item)
+        except (TypeError, ValueError):
+            continue
+        if item > 0:
+            result.add(item)
+    return result
+
+
+def normalize_whisper_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep legacy and canonical whisper unlock fields synchronized.
+
+    Older captures only contained ``unlockSoulWhispers`` from PlayerPOD.  The
+    local mall handler reads ``soulWhisperUnlocks.whisperIds`` instead, so a
+    snapshot with only the former lost private whispers after import.
+    """
+    normalized = [dict(row) for row in rows]
+    by_name = {
+        str(row.get("field_name")): row
+        for row in normalized
+        if isinstance(row, dict) and row.get("field_name")
+    }
+    legacy = by_name.get(WHISPER_LIST_FIELD)
+    canonical = by_name.get(WHISPER_STATE_FIELD)
+    if legacy is None and canonical is None:
+        return normalized
+
+    all_ids = set()
+    if legacy is not None:
+        try:
+            all_ids |= whisper_ids(json.loads(str(legacy.get("value_json") or "[]")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if canonical is not None:
+        try:
+            all_ids |= whisper_ids(json.loads(str(canonical.get("value_json") or "{}")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if not all_ids:
+        return normalized
+
+    values = sorted(all_ids)
+    if legacy is not None:
+        legacy["value_json"] = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    if canonical is None:
+        template = dict(legacy or {})
+        template["field_name"] = WHISPER_STATE_FIELD
+        template["value_json"] = json.dumps(
+            {"whisperIds": values}, ensure_ascii=False, separators=(",", ":")
+        )
+        normalized.append(template)
+    else:
+        canonical["value_json"] = json.dumps(
+            {"whisperIds": values}, ensure_ascii=False, separators=(",", ":")
+        )
+    return normalized
+
+
 def stable_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -232,6 +302,9 @@ def export_snapshot(db: Path, identity: str, output: Path) -> dict[str, Any]:
             rows, omitted = collect_table_rows(connection, table, uid, replacements)
             tables[table] = rows
             sensitive_fields.extend(f"{table}.{field}" for field in omitted)
+        tables["player_state_json"] = normalize_whisper_rows(
+            tables["player_state_json"]
+        )
 
         player_data = row_dict(player)
         snapshot = {
@@ -255,9 +328,18 @@ def export_snapshot(db: Path, identity: str, output: Path) -> dict[str, Any]:
         }
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.part-{os.getpid()}")
-    temporary.write_text(
-        json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    if output.suffix.lower() == ".soulaccount":
+        payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        value = {
+            "kind": ACCOUNT_ARTIFACT_KIND,
+            "version": ACCOUNT_ARTIFACT_VERSION,
+            "payloadSha256": hashlib.sha256(payload).hexdigest(),
+            "payload": snapshot,
+        }
+        encoded = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    else:
+        encoded = json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
+    temporary.write_text(encoded, encoding="utf-8")
     os.replace(temporary, output)
     return snapshot
 
@@ -267,6 +349,16 @@ def load_snapshot(path: Path) -> dict[str, Any]:
         snapshot = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid snapshot JSON: {path}: {exc}") from exc
+    if isinstance(snapshot, dict) and snapshot.get("kind") == ACCOUNT_ARTIFACT_KIND:
+        if snapshot.get("version") != ACCOUNT_ARTIFACT_VERSION:
+            raise ValueError(f"unsupported account file version: {snapshot.get('version')}")
+        payload = snapshot.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("account file payload must be an object")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if hashlib.sha256(encoded).hexdigest() != str(snapshot.get("payloadSha256")):
+            raise ValueError("account file checksum mismatch")
+        snapshot = payload
     validate_snapshot(snapshot)
     return snapshot
 
@@ -379,7 +471,10 @@ def prepare_import_rows(
     connection: sqlite3.Connection,
     snapshot: dict[str, Any],
 ) -> dict[str, list[dict[str, Any]]]:
-    tables = snapshot["tables"]
+    tables = dict(snapshot["tables"])
+    tables["player_state_json"] = normalize_whisper_rows(
+        tables["player_state_json"]
+    )
     equipment_replacements = allocate_equipment_ids(
         connection, tables["equipment_instances"]
     )
@@ -504,8 +599,104 @@ def import_snapshot(
     return {"targetUid": target_uid, "targetUuid": target_uuid, "counts": counts, "dryRun": False}
 
 
+def restore_snapshot(
+    db: Path,
+    snapshot_path: Path,
+    target_channel_uid: str,
+) -> dict[str, Any]:
+    """Replace the fixed local account with an imported snapshot.
+
+    Mobile builds already route login to one local channel identity.  The
+    regular import command intentionally creates a new identity, which is
+    unsuitable here because the client would continue logging into the old
+    one.  Keep the identity stable and replace only its account-scoped rows
+    in one transaction.
+    """
+    snapshot = load_snapshot(snapshot_path)
+    target_channel_uid = target_channel_uid.strip()
+    if not target_channel_uid or target_channel_uid.startswith("__"):
+        raise ValueError("target channel UID must be a fixed non-empty local identifier")
+    target_uid, target_uuid = target_identity(target_channel_uid)
+    source = snapshot.get("source") or {}
+    now = int(time.time())
+    with closing(open_write(db)) as connection:
+        require_tables(connection, ("accounts",) + ACCOUNT_TABLES)
+        connection.execute("BEGIN IMMEDIATE")
+        account = connection.execute(
+            "SELECT uid FROM accounts WHERE channel_uid=? OR uid=? OR uuid=? LIMIT 1",
+            (target_channel_uid, target_uid, target_uuid),
+        ).fetchone()
+        if account is None:
+            connection.execute(
+                """
+                INSERT INTO accounts(
+                    channel_uid,uid,uuid,username,channel_id,created_at,
+                    last_http_login_at,last_tcp_login_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    target_channel_uid,
+                    target_uid,
+                    target_uuid,
+                    str(source.get("username") or "local_player"),
+                    str(source.get("channelId") or "46"),
+                    now,
+                    now,
+                    None,
+                    now,
+                ),
+            )
+        elif str(account["uid"]) != target_uid:
+            raise ValueError("target local identity has inconsistent uid/uuid mapping")
+        else:
+            connection.execute(
+                """
+                UPDATE accounts
+                SET username=?, channel_id=?, last_http_login_at=?, last_seen_at=?
+                WHERE uid=?
+                """,
+                (
+                    str(source.get("username") or "local_player"),
+                    str(source.get("channelId") or "46"),
+                    now,
+                    now,
+                    target_uid,
+                ),
+            )
+
+        for table in reversed(ACCOUNT_TABLES):
+            connection.execute(f'DELETE FROM "{table}" WHERE uid=?', (target_uid,))
+        prepared = prepare_import_rows(connection, snapshot)
+        omit_id_tables = {"items", "souls", "tasks", "lottery_history"}
+        counts: dict[str, int] = {}
+        for table in ACCOUNT_TABLES:
+            omit = {"id"} if table in omit_id_tables else set()
+            counts[table] = insert_rows(
+                connection, table, prepared[table], target_uid, omit
+            )
+        connection.commit()
+    return {"targetUid": target_uid, "counts": counts, "replaced": True}
+
+
 def write_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def pack_account_file(snapshot_path: Path, output: Path) -> dict[str, Any]:
+    """Validate a redacted snapshot and wrap it for the mobile service APK."""
+    snapshot = load_snapshot(snapshot_path)
+    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    artifact = {
+        "kind": ACCOUNT_ARTIFACT_KIND,
+        "version": ACCOUNT_ARTIFACT_VERSION,
+        "payloadSha256": hashlib.sha256(payload).hexdigest(),
+        "payload": snapshot,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.part-{os.getpid()}")
+    temporary.write_text(json.dumps(artifact, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, output)
+    return account_summary(snapshot)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -520,6 +711,10 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("inspect", "verify"):
         command = sub.add_parser(name, help=f"{name} a snapshot without changing the database")
         command.add_argument("snapshot", type=Path)
+
+    pack = sub.add_parser("pack", help="wrap a verified snapshot as a mobile-service .soulaccount file")
+    pack.add_argument("snapshot", type=Path)
+    pack.add_argument("--output", type=Path, required=True)
 
     import_command = sub.add_parser("import", help="import into a new local identity")
     import_command.add_argument("snapshot", type=Path)
@@ -539,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in ("inspect", "verify"):
             snapshot = load_snapshot(args.snapshot)
             write_json(account_summary(snapshot))
+        elif args.command == "pack":
+            write_json(pack_account_file(args.snapshot, args.output))
         else:
             result = import_snapshot(
                 database_path(str(args.db) if args.db else None),

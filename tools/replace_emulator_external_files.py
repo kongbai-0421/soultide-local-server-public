@@ -24,9 +24,9 @@ from sync_nonfull_resources import (
 
 
 DEFAULT_PACKAGE = "com.glkj.lhcx.aligames"
-DEFAULT_DEVICE = ""
-DEFAULT_ADB = Path("adb.exe")
-DEFAULT_RESOURCE_ROOT = Path("offline_cdn") / "Android"
+DEFAULT_DEVICE = "127.0.0.1:16416"
+DEFAULT_ADB = Path(r"E:\A灵魂潮汐\服务器\dependencies\android-sdk\platform-tools\adb.exe")
+DEFAULT_RESOURCE_ROOT = Path(r"E:\A灵魂潮汐\服务器\offline_cdn\Android")
 
 
 def safe_relative(value: str) -> str:

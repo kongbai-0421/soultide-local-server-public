@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import account_snapshot  # noqa: E402
 
@@ -25,6 +25,10 @@ def integer_values(value):
         yield value
 
 
+@unittest.skipUnless(
+    (ROOT / "soultide.db").is_file(),
+    "requires a private local database fixture",
+)
 class AccountSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory(prefix="soultide-account-snapshot-")
@@ -103,6 +107,51 @@ class AccountSnapshotTests(unittest.TestCase):
             target_values.update(integer_values(json.loads(value)))
         self.assertTrue(target_equipment.intersection(target_values))
         self.assertFalse(source_equipment.intersection(target_values))
+
+    def test_soulaccount_artifact_preserves_snapshot_contract(self):
+        artifact = self.temp_root / "player.soulaccount"
+        exported = account_snapshot.export_snapshot(
+            self.database, self.source_uid, artifact
+        )
+        envelope = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(envelope["kind"], account_snapshot.ACCOUNT_ARTIFACT_KIND)
+        self.assertEqual(account_snapshot.load_snapshot(artifact), exported)
+        envelope["payload"]["tables"]["players"][0]["uid"] = "tampered"
+        artifact.write_text(json.dumps(envelope), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            account_snapshot.load_snapshot(artifact)
+
+    def test_legacy_whisper_list_is_promoted_on_import(self):
+        account_snapshot.export_snapshot(
+            self.database, self.source_uid, self.snapshot_path
+        )
+        snapshot = account_snapshot.load_snapshot(self.snapshot_path)
+        state_rows = snapshot["tables"]["player_state_json"]
+        state_rows[:] = [
+            row for row in state_rows if row["field_name"] != "soulWhisperUnlocks"
+        ]
+        legacy = next(
+            row for row in state_rows if row["field_name"] == "unlockSoulWhispers"
+        )
+        expected = set(json.loads(legacy["value_json"]))
+        self.snapshot_path.write_text(
+            json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
+        )
+        result = account_snapshot.import_snapshot(
+            self.database,
+            self.snapshot_path,
+            "snapshot-test-legacy-whisper",
+            None,
+            None,
+            False,
+        )
+        with closing(sqlite3.connect(self.database)) as connection:
+            row = connection.execute(
+                "SELECT value_json FROM player_state_json WHERE uid=? AND field_name=?",
+                (result["targetUid"], "soulWhisperUnlocks"),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(set(json.loads(row[0])["whisperIds"]), expected)
 
     def test_second_import_fails_without_partial_target_rows(self):
         account_snapshot.export_snapshot(

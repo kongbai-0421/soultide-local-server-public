@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">灵魂潮汐本地服务</string>
+    <string name="notification_title">本地服务运行中</string>
+    <string name="notification_text">本地资源与账号服务正在后台运行</string>
+</resources>

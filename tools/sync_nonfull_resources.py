@@ -713,12 +713,12 @@ def main() -> int:
     parser.add_argument(
         "--resource-root",
         type=Path,
-        default=Path("offline_cdn") / "Android",
+        default=Path(r"E:\A灵魂潮汐\服务器\offline_cdn\Android"),
     )
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("offline_cdn") / "Android" / "version-local-nonfull.json",
+        default=Path(r"E:\A灵魂潮汐\服务器\offline_cdn\Android\version-local-nonfull.json"),
     )
     parser.add_argument("--quick-verify", action="store_true")
     parser.add_argument(

@@ -29,6 +29,7 @@ ASSET_ROOT = Path(
     )
 )
 _configured_manifest = os.environ.get("SOULTIDE_LOCAL_MANIFEST", "").strip()
+BUNDLED_MANIFEST = ROOT / "version-local-default.json"
 if _configured_manifest:
     # An explicit manifest is useful for diagnostics and official-list
     # compatibility.  Keep that override, but make the non-full package
@@ -48,6 +49,11 @@ else:
         LOCAL_MANIFEST = _built_manifest
     elif _nonfull_manifest.is_file():
         LOCAL_MANIFEST = _nonfull_manifest
+    elif BUNDLED_MANIFEST.is_file():
+        # The service APK carries this small bootstrap manifest so the game can
+        # complete version negotiation before a full external resource pack is
+        # imported into SOULTIDE_ASSET_ROOT.
+        LOCAL_MANIFEST = BUNDLED_MANIFEST
     else:
         LOCAL_MANIFEST = ASSET_ROOT / "version-local.json"
 ALLOW_UPSTREAM = (
@@ -699,14 +705,26 @@ async def catch_all(path: str, request: Request):
     return JSONResponse(offline_success())
 
 
-if __name__ == "__main__":
-    manifest_count = sum(1 for item in ASSET_ROOT.rglob("*") if item.is_file())
+def serve():
+    # Recursive resource counting is diagnostic-only and can take minutes on
+    # an Android shared storage mirror.  Do not block the mobile server before
+    # it starts accepting the game's HTTP requests.
+    manifest_count = None if os.environ.get("SOULTIDE_MOBILE_MODE") == "1" else sum(
+        1 for item in ASSET_ROOT.rglob("*") if item.is_file()
+    )
     log.info(
         "HTTP server starting on 0.0.0.0:8081 (offline=%s, CDN fallback=%s)",
         not ALLOW_UPSTREAM,
         CDN_UPSTREAM_FALLBACK,
     )
     log.info("TCP target: %s:%s", CONFIG["server_ip"], CONFIG["tcp_port"])
-    log.info("Local CDN: %s (%d files)", ASSET_ROOT, manifest_count)
+    if manifest_count is None:
+        log.info("Local CDN: %s (file count skipped on mobile)", ASSET_ROOT)
+    else:
+        log.info("Local CDN: %s (%d files)", ASSET_ROOT, manifest_count)
     log.info("Local manifest: %s", LOCAL_MANIFEST)
     uvicorn.run(app, host=_BIND_HOST, port=HTTP_PORT, log_level="info")
+
+
+if __name__ == "__main__":
+    serve()

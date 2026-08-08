@@ -244,7 +244,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return
 
 
-if __name__ == "__main__":
+def serve():
     port = int(os.environ.get("SOULTIDE_SDK_PORT", "8000"))
     log.info("SDK server starting on 0.0.0.0:%d (fully local)", port)
     http.server.ThreadingHTTPServer((_BIND_HOST, port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    serve()

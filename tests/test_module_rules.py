@@ -9,12 +9,16 @@ from pathlib import Path
 
 TEST_DIR = tempfile.TemporaryDirectory()
 os.environ["SOULTIDE_DB_PATH"] = str(Path(TEST_DIR.name) / "module-rules-test.db")
+ROOT = Path(__file__).resolve().parents[1]
+PROTOCOL_METADATA = ROOT / "analysis" / "net_metadata.json"
 
-import module_handlers
-import module_rules
-import protocol_codec
-import storage
-import login_server
+if PROTOCOL_METADATA.is_file():
+    import module_handlers
+    import module_rules
+    import protocol_codec
+    import storage
+    import login_server
+    import tcp_server
 
 
 class FakeSession:
@@ -75,6 +79,10 @@ class FakeSession:
         return True
 
 
+@unittest.skipUnless(
+    PROTOCOL_METADATA.is_file(),
+    "requires private protocol metadata fixture",
+)
 class ModuleRuleTests(unittest.TestCase):
     def setUp(self):
         account = storage.get_or_create_account("module-rule-" + self._testMethodName)
@@ -599,27 +607,63 @@ class ModuleRuleTests(unittest.TestCase):
 
     def test_home_trigger_plot_accepts_official_dialog_and_is_idempotent(self):
         self.assertTrue(module_handlers.dispatch(self.session, self.uid, 1802, b""))
-        plot_id = min(module_handlers.HOME_CONFIG["homePlotDialogCids"])
+        action_id, dialog_id = min(
+            (
+                int(action_id),
+                int(dialog_id),
+            )
+            for action_id, dialog_id in module_handlers.HOME_CONFIG["homePlotDialogs"].items()
+        )
         self.assertFalse(module_handlers.dispatch(
             self.session, self.uid, 1810,
             protocol_codec.encode_method(1810, 99999999),
         ))
         self.assertTrue(module_handlers.dispatch(
             self.session, self.uid, 1810,
-            protocol_codec.encode_method(1810, plot_id),
+            protocol_codec.encode_method(1810, action_id),
         ))
-        code, returned_id = protocol_codec.decode_method(1842, self.session.messages[-1][1])
-        self.assertEqual((code, returned_id), (0, plot_id))
+        code, returned_id = protocol_codec.decode_method(
+            1842,
+            next(body for message_id, body in self.session.messages if message_id == 1842),
+        )
+        self.assertEqual((code, returned_id), (0, action_id))
+        open_dialog = next(body for message_id, body in self.session.messages if message_id == 1604)
+        self.assertEqual(protocol_codec.decode_method(1604, open_dialog), [dialog_id])
+        self.assertEqual(self.session.active_story["plot_id"], action_id)
         self.assertTrue(module_handlers.dispatch(
             self.session, self.uid, 1810,
-            protocol_codec.encode_method(1810, plot_id),
+            protocol_codec.encode_method(1810, action_id),
         ))
         code, returned_id = protocol_codec.decode_method(1842, self.session.messages[-1][1])
-        self.assertEqual((code, returned_id), (1, plot_id))
+        self.assertEqual((code, returned_id), (1, action_id))
         self.assertEqual(
             storage.get_player_state_json(self.uid, "home")["plots"],
-            [plot_id],
+            [action_id],
         )
+
+    def test_home_plot_dialog_completion_closes_session_dialog(self):
+        self.assertTrue(module_handlers.dispatch(self.session, self.uid, 1802, b""))
+        action_id, dialog_id = min(
+            (
+                int(action_id),
+                int(dialog_id),
+            )
+            for action_id, dialog_id in module_handlers.HOME_CONFIG["homePlotDialogs"].items()
+        )
+        self.assertTrue(module_handlers.dispatch(
+            self.session, self.uid, 1810,
+            protocol_codec.encode_method(1810, action_id),
+        ))
+        self.assertTrue(tcp_server.Session.handle_select_dialog(
+            self.session,
+            protocol_codec.encode_method(1602, 1, []),
+        ))
+        self.assertEqual(self.session.messages[-1][0], 1603)
+        self.assertEqual(
+            protocol_codec.decode_method(1603, self.session.messages[-1][1]),
+            [0, -1],
+        )
+        self.assertIsNone(self.session.active_story)
 
     def test_home_unlock_dorm_rejected_for_castle_index_one(self):
         """CastleIndex=1 功能房（如 7 号）不允许通过新增宿舍入口重复解锁。"""

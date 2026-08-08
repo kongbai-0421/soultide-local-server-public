@@ -23,6 +23,11 @@ apk_build/
 launcher_output/
 python-*.exe
 
+# Android service build outputs and copied runtime payloads
+mobile_service/build/
+mobile_service/logs/
+mobile_service/runtime/
+
 # Local machine configuration
 .env
 *.local.*

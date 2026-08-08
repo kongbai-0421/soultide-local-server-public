@@ -8,8 +8,8 @@ param(
     [string]$Package = "com.glkj.lhcx.aligames",
     [string]$ResourceRoot = "",
     [string]$ManifestPath = "",
-    [string]$AdbPath = "",
-    [string]$PythonPath = "",
+    [string]$AdbPath = "C:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe",
+    [string]$PythonPath = "C:\Users\kongbai\.workbuddy\binaries\python\versions\3.13.12\python.exe",
     [switch]$QuickVerify
 )
 

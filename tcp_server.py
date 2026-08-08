@@ -111,6 +111,18 @@ MAZE_CHALLENGE_BONUS_PATH = os.environ.get(
 MAX_FRAME_SIZE = 2 * 1024 * 1024
 
 
+def _notification_poll_seconds():
+    """Keep HTTP-originated grants responsive without coupling server processes."""
+    try:
+        value = float(os.environ.get("SOULTIDE_NOTIFICATION_POLL_SECONDS", "0.25"))
+    except ValueError:
+        value = 0.25
+    return min(2.0, max(0.1, value))
+
+
+NOTIFICATION_POLL_SECONDS = _notification_poll_seconds()
+
+
 def _load_player_config_ids(filename):
     """Read every cosmetic ID from the client table used by this server."""
     path = os.path.join(
@@ -2161,10 +2173,14 @@ class Session:
         self.active_story = None
         self.player_snapshot = None
         self.running = True
+        self._send_lock = threading.RLock()
+        self._notification_stop = threading.Event()
+        self._notification_thread = None
         log.info("New connection from %s", addr)
 
     def send(self, msg_id, body=b"", order=0):
-        self.conn.sendall(encode_msg(msg_id, body, order))
+        with self._send_lock:
+            self.conn.sendall(encode_msg(msg_id, body, order))
         preview = body.hex() if body and len(body) <= 80 else ""
         log.info(
             "  [S->C] MsgID=%d order=%d body=%db%s",
@@ -2178,6 +2194,7 @@ class Session:
         if not self.account:
             return 0
         notifications = storage.pop_pending_tcp_notifications(self.uid)
+        refresh_base_info = False
         for notification in notifications:
             for cid, quantity in notification.get("changedAttrs", {}).items():
                 self.send(3924, protocol_codec.encode_method(3924, {int(cid): int(quantity)}))
@@ -2188,7 +2205,6 @@ class Session:
                 rewards = [
                     {"cid": int(cid), "num": int(quantity), "tag": 0}
                     for cid, quantity in notification.get("rewards", [])
-                    if int(cid) != 5
                 ]
                 pay_point = sum(
                     int(quantity) for cid, quantity in notification.get("rewards", [])
@@ -2217,9 +2233,27 @@ class Session:
                     self.send(3937, protocol_codec.encode_method(
                         3937, {pay_id: 1}, {pay_id: False}
                     ))
+                refresh_base_info = True
+        if refresh_base_info:
+            # 3924 updates the attribute store, while PlayerBaseInfo refreshes
+            # the visible moonstone counter before the recharge reward popup.
+            module_handlers._send_base_info_update(self, self.uid)
         if notifications:
             log.info("  flushed %d pending TCP notifications uid=%s", len(notifications), self.uid)
         return len(notifications)
+
+    def _notification_loop(self):
+        """Deliver HTTP purchase grants promptly while this TCP session is live."""
+        while not self._notification_stop.wait(NOTIFICATION_POLL_SECONDS):
+            if not self.account:
+                continue
+            try:
+                self._flush_pending_tcp_notifications()
+            except (ConnectionError, OSError) as exc:
+                log.info("  notification delivery stopped: %s", exc)
+                return
+            except Exception:
+                log.exception("  pending notification delivery failed uid=%s", self.uid)
 
     def send_local_fixture(self, msg_id, required=False):
         body = REPLAY.body(msg_id) if REPLAY else None
@@ -6680,6 +6714,12 @@ class Session:
     def run(self):
         try:
             if self.handshake():
+                self._notification_thread = threading.Thread(
+                    target=self._notification_loop,
+                    name="soultide-tcp-notify",
+                    daemon=True,
+                )
+                self._notification_thread.start()
                 self.message_loop()
         except socket.timeout:
             log.info("  handshake timeout")
@@ -6688,12 +6728,16 @@ class Session:
         except Exception:
             log.exception("  session error")
         finally:
+            self.running = False
+            self._notification_stop.set()
+            if self._notification_thread is not None:
+                self._notification_thread.join(timeout=1)
             storage.close_session(self.session_id)
             self.conn.close()
             log.info("  connection closed")
 
 
-def main():
+def serve():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((_BIND_HOST, TCP_PORT))
@@ -6708,5 +6752,8 @@ def main():
         threading.Thread(target=session.run, daemon=True).start()
 
 
+main = serve
+
+
 if __name__ == "__main__":
-    main()
+    serve()

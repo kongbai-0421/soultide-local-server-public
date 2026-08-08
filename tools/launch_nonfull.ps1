@@ -35,7 +35,7 @@ trap {
 
 if (-not $AdbPath) {
     $projectAdb = Join-Path $serverRoot "dependencies\android-sdk\platform-tools\adb.exe"
-    $mumuAdb = ""
+    $mumuAdb = "C:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe"
     $AdbPath = if (Test-Path -LiteralPath $projectAdb -PathType Leaf) {
         $projectAdb
     } elseif (Test-Path -LiteralPath $mumuAdb -PathType Leaf) {
@@ -45,7 +45,12 @@ if (-not $AdbPath) {
     }
 }
 if (-not $PythonPath) {
-    $PythonPath = (Get-Command python -ErrorAction Stop).Source
+    $managedPython = "C:\Users\kongbai\.workbuddy\binaries\python\versions\3.13.12\python.exe"
+    $PythonPath = if (Test-Path -LiteralPath $managedPython -PathType Leaf) {
+        $managedPython
+    } else {
+        (Get-Command python -ErrorAction Stop).Source
+    }
 }
 $python = $PythonPath
 
