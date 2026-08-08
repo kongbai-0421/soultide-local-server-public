@@ -143,7 +143,18 @@ final class LocalHttpServer {
         int marker = path.indexOf("/Android/", prefix.length());
         if (marker < 0) return new File("");
         String relative = path.substring(marker + 9);
-        return "version.json".equalsIgnoreCase(relative) ? new File(assets, "version-remote.json") : safe(relative);
+        return "version.json".equalsIgnoreCase(relative) ? versionManifest() : safe(relative);
+    }
+
+    /**
+     * The full Unity resource pack belongs to the game app on Android 13 and
+     * is not readable by this service app. Keep its small version manifest in
+     * the service runtime so the first update check can succeed independently.
+     */
+    private static File versionManifest() {
+        File imported = new File(assets, "version-remote.json");
+        if (imported.isFile()) return imported;
+        return new File(server, "version-local-default.json");
     }
 
     private static File safe(String raw) {
@@ -156,7 +167,7 @@ final class LocalHttpServer {
     }
 
     private static String version() {
-        String game = "0.49.10"; long resource = 0; File manifest = new File(assets, "version-remote.json");
+        String game = "0.49.10"; long resource = 0; File manifest = versionManifest();
         try {
             String text = new String(read(manifest), StandardCharsets.UTF_8);
             Matcher g = Pattern.compile("\\\"ApplicableGameVersion\\\"\\s*:\\s*\\\"([^\\\"]+)").matcher(text);
