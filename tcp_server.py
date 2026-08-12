@@ -1902,7 +1902,7 @@ def overlay_companion_snapshot(body, uid):
         player_pod.get("failQuestList", []),
         player_pod.get("unlockChapterTasks", []),
     )
-    storage.reconcile_sign_in_quest(uid)
+    sign_quest = storage.reconcile_sign_in_quest(uid)
     storage.seed_player_companion_state(uid, player_pod)
     storage.seed_player_state_json(uid, player_pod)
     added_dresses = storage.ensure_owned_dresses(uid, LIBRARY_UNLOCK_CONFIG.get("dressCids", []))
@@ -1947,6 +1947,28 @@ def overlay_companion_snapshot(body, uid):
         quest_state[key] for key in ("finishQuestList", "failQuestList", "unlockChapterTasks")
     ):
         player_pod.update(quest_state)
+    # The captured PlayerPOD can retain an old calendar and seven-day quest.
+    # The local sign-in tables are authoritative after the 04:00 reset.
+    sign_info = storage.get_player_state_json(uid, "signInfo")
+    if isinstance(sign_info, int):
+        player_pod["signInfo"] = sign_info
+    if isinstance(sign_quest, dict):
+        player_pod["quests"] = [
+            quest for quest in player_pod.get("quests", [])
+            if isinstance(quest, dict)
+            and int(quest.get("cid", 0) or 0) != storage.SIGN_IN_QUEST_ID
+        ]
+        if not sign_quest.get("completed"):
+            player_pod["quests"].append({
+                "cid": int(sign_quest["cid"]),
+                "finNum": int(sign_quest["finNum"]),
+                "tgtNum": int(sign_quest["tgtNum"]),
+                "createTime": int(sign_quest["createTime"]),
+            })
+        player_pod["finishQuestList"] = [
+            int(cid) for cid in player_pod.get("finishQuestList", [])
+            if int(cid) != storage.SIGN_IN_QUEST_ID
+        ]
     overlay_fishing_activity_snapshot(player_pod, uid)
     local_souls = {row["soul_id"]: row for row in storage.get_souls(uid)}
     changed = []
@@ -2437,6 +2459,13 @@ class Session:
     def _restore_active_battle_context(self):
         if not self.account:
             return None
+        released = storage.abandon_stale_active_battles(self.uid)
+        if released:
+            log.warning(
+                "  released stale battle locks uid=%s count=%d before reconnect",
+                self.uid,
+                released,
+            )
         battle = storage.get_active_battle(self.uid)
         if battle is None:
             return None
@@ -6164,27 +6193,85 @@ class Session:
         log.info("  exchange committed uid=%s cid=%d count=%d -> %d", self.uid, cid, count, EXCHANGE_RESULT)
         return True
 
+    def _ensure_dating_snapshot(self):
+        """Build the local snapshot when dating arrives before LOAD_PLAYER finishes."""
+        if self.player_snapshot is not None:
+            return True
+        if not self.account or REPLAY is None:
+            return False
+        captured = REPLAY.body(LOAD_PLAYER_RESULT)
+        if captured is None:
+            log.warning("  dating snapshot unavailable uid=%s", self.uid)
+            return False
+        try:
+            _, _, snapshot = overlay_companion_snapshot(captured, self.uid)
+        except Exception:
+            log.exception("  dating snapshot initialization failed uid=%s", self.uid)
+            return False
+        if not isinstance(snapshot, dict):
+            log.warning("  dating snapshot invalid uid=%s", self.uid)
+            return False
+        self.player_snapshot = snapshot
+        log.info("  dating snapshot initialized lazily uid=%s souls=%d", self.uid, len(snapshot.get("souls", [])))
+        return True
+
     def handle_start_dating(self, body):
         try:
             soul_id, event_id = protocol_codec.decode_method(START_DATING, body)
         except ValueError as exc:
             log.warning("  invalid dating body %s: %s", body.hex(), exc)
             return False
-        if not self.account or self.player_snapshot is None or self.active_story is not None:
-            return False
+        def reject(reason):
+            # The UI owns a full-screen loading state while waiting for 1503.
+            # Always answer a valid request, including local validation failures,
+            # so an unavailable event cannot leave that state orphaned.
+            self.send(
+                START_DATING_RESULT,
+                protocol_codec.encode_method(START_DATING_RESULT, 1, soul_id, event_id),
+            )
+            log.warning(
+                "  dating rejected uid=%s soulCid=%d eventCid=%d reason=%s -> %d",
+                self.uid,
+                soul_id,
+                event_id,
+                reason,
+                START_DATING_RESULT,
+            )
+            return True
+
+        if not self.account:
+            return reject("no_session")
+        if not Session._ensure_dating_snapshot(self):
+            return reject("snapshot_unavailable")
+        if self.active_story is not None:
+            # A client that was interrupted during the dialog can reconnect
+            # on the same TCP session and retry the entry request. Dating is
+            # not a server-side battle/maze lock, so discard only this stale
+            # dialog state and allow the retry to proceed.
+            if isinstance(self.active_story, dict) and self.active_story.get("kind") == "dating":
+                log.warning(
+                    "  dating stale state recovered uid=%s oldEventCid=%s",
+                    self.uid,
+                    self.active_story.get("event_id"),
+                )
+                self.active_story = None
+            else:
+                return reject("active_story")
+        if soul_id <= 0 or event_id <= 0:
+            return reject("invalid_id")
         event = COMPANION_RULES.get("dating_events", {}).get(str(event_id))
         companion = storage.get_companion(self.uid, soul_id)
         if not event or not companion or event.get("SoulId") != soul_id:
-            return False
+            return reject("unknown_event")
         if companion["favor_level"] < int(event.get("UnlockLevel") or 1):
-            return False
+            return reject("favor_level")
         predecessor = event.get("NeedDownDatingId")
         if predecessor and not storage.has_dating_record(self.uid, soul_id, predecessor):
-            return False
+            return reject("predecessor")
         costs = list(zip(event.get("Cost", [])[::2], event.get("Cost", [])[1::2]))
         inventory = {row["template_id"]: row["quantity"] for row in storage.get_items(self.uid)}
         if any(inventory.get(cid, 0) < quantity for cid, quantity in costs):
-            return False
+            return reject("cost")
         self.active_story = {
             "kind": "dating",
             "soul_id": soul_id,
@@ -6236,7 +6323,12 @@ class Session:
             end_level,
         ):
             log.warning("  dating settlement transaction rejected uid=%s eventCid=%d", self.uid, dating["event_id"])
-            return False
+            self.send(
+                SELECT_DIALOG_RESULT,
+                protocol_codec.encode_method(SELECT_DIALOG_RESULT, 1, -1),
+            )
+            self.active_story = None
+            return True
 
         self.send(SELECT_DIALOG_RESULT, protocol_codec.encode_method(SELECT_DIALOG_RESULT, 0, -1))
         inventory = {row["template_id"]: row["quantity"] for row in storage.get_items(self.uid)}
@@ -6292,9 +6384,30 @@ class Session:
         except ValueError as exc:
             log.warning("  invalid story chapter body %s: %s", body.hex(), exc)
             return False
+        def reject(reason):
+            # 3403 is the completion gate for the chapter loading view.  A
+            # failure code is required even when the local server cannot open
+            # the requested chapter.
+            self.send(
+                EXPERIENCE_STORY_CHAPTER_RESULT,
+                protocol_codec.encode_method(
+                    EXPERIENCE_STORY_CHAPTER_RESULT, 1, story_cid, chapter_index
+                ),
+            )
+            log.warning(
+                "  story chapter rejected uid=%s storyCid=%d chapterIndex=%d reason=%s -> %d",
+                self.uid,
+                story_cid,
+                chapter_index,
+                reason,
+                EXPERIENCE_STORY_CHAPTER_RESULT,
+            )
+            return True
+
         if not self.account:
-            log.warning("  story chapter rejected for compatibility session")
-            return False
+            return reject("no_session")
+        if self.active_story is not None:
+            return reject("active_story")
         story_config = STORY_CONFIG.get(str(story_cid))
         chapter_config = (
             story_config.get("chapters", {}).get(str(chapter_index))
@@ -6302,23 +6415,16 @@ class Session:
             else None
         )
         if chapter_config is None:
-            log.warning(
-                "  story chapter rejected: no config for storyCid=%d chapterIndex=%d",
-                story_cid,
-                chapter_index,
-            )
-            return False
+            return reject("unknown_chapter")
         if not storage.record_story_chapter(self.uid, story_cid, chapter_index):
-            log.warning(
-                "  story chapter rejected: uid=%s storyCid=%d chapterIndex=%d",
-                self.uid,
-                story_cid,
-                chapter_index,
-            )
-            return False
+            return reject("storage")
 
-        # Result fields are code, storyCid and chapterIndex in the same scalar encoding.
-        self.send(EXPERIENCE_STORY_CHAPTER_RESULT, b"\x50" + body)
+        self.send(
+            EXPERIENCE_STORY_CHAPTER_RESULT,
+            protocol_codec.encode_method(
+                EXPERIENCE_STORY_CHAPTER_RESULT, 0, story_cid, chapter_index
+            ),
+        )
         dialog_cid = int(chapter_config["dialog_cid"])
         self.send(NOTIFY_OPEN_DIALOG, encode_compact_uint(dialog_cid))
         self.active_story = {

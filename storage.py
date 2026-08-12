@@ -3378,7 +3378,15 @@ def _ensure_active_sign_table():
 
 SIGN_IN_RULES = {"1": {"Id": 1, "Reward": [2, 20]}}
 SIGN_IN_QUEST_ID = 10190101
-SIGN_IN_QUEST_TARGET = 7
+# The client displays the monthly milestone as seven-day sign-in 2/5.
+SIGN_IN_QUEST_TARGET = 5
+SIGN_IN_RESET_HOUR = 4
+
+
+def _sign_in_datetime(now=None):
+    """Return the game's local date after its 04:00 daily reset."""
+    timestamp = time.time() if now is None else now
+    return time.localtime(timestamp - SIGN_IN_RESET_HOUR * 60 * 60)
 
 
 def configure_sign_in(sign_in_rules):
@@ -3392,11 +3400,20 @@ def configure_sign_in(sign_in_rules):
 
 
 def _sign_in_reward(today):
+    today_parts = str(today).replace("-", "/").split("/")
+    try:
+        normalized_today = "/".join(str(int(part)) for part in today_parts)
+    except (TypeError, ValueError):
+        normalized_today = str(today).replace("-", "/")
     for value in SIGN_IN_RULES.values():
         date_value = str(value.get("Date", "") or "").replace("-", "/")
         if date_value:
             parts = date_value.split("/")
-            if len(parts) == 3 and "/".join(str(int(part)) for part in parts) == today.replace("-", "/"):
+            try:
+                normalized_date = "/".join(str(int(part)) for part in parts)
+            except (TypeError, ValueError):
+                normalized_date = ""
+            if len(parts) == 3 and normalized_date == normalized_today:
                 reward = value.get("Reward")
                 if isinstance(reward, list) and len(reward) >= 2:
                     return [(int(reward[0]), int(reward[1]))]
@@ -3453,7 +3470,7 @@ def reconcile_sign_in_quest(uid):
     if not uid:
         return None
     now = int(time.time())
-    month = time.strftime("%Y-%m", time.localtime(now))
+    month = time.strftime("%Y-%m", _sign_in_datetime(now))
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
@@ -3473,12 +3490,37 @@ def reconcile_sign_in_quest(uid):
         )
 
 
+def reconcile_all_sign_in_quests():
+    """Repair stale sign-in quest targets for every locally stored account."""
+    now = int(time.time())
+    month = time.strftime("%Y-%m", _sign_in_datetime(now))
+    repaired = 0
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT uid,sign_info,sign_month FROM active_sign_in"
+        ).fetchall()
+        for row in rows:
+            sign_info = int(row["sign_info"] or 0) if row["sign_month"] == month else 0
+            connection.execute(
+                "INSERT INTO player_state_json(uid,field_name,value_json,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(uid,field_name) DO UPDATE SET "
+                "value_json=excluded.value_json,updated_at=excluded.updated_at",
+                (row["uid"], "signInfo", json.dumps(sign_info), now),
+            )
+            _rebuild_sign_in_quest_connection(
+                connection, row["uid"], sign_info.bit_count(), now
+            )
+            repaired += 1
+    return repaired
+
+
 def record_sign_in(uid):
     """Sign today and update calendar, reward, JSON and seven-day quest atomically."""
     if not uid:
         return None
     now = int(time.time())
-    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    today = time.strftime("%Y-%m-%d", _sign_in_datetime(now))
     month = today[:7]
     day = int(today[8:10])
     day_bit = 1 << (day - 1)
@@ -7315,6 +7357,31 @@ def get_active_battle(uid, battle_type=None):
     with connect() as connection:
         row = connection.execute(query, params).fetchone()
     return dict(row) if row else None
+
+
+def abandon_stale_active_battles(uid, max_age_seconds=24 * 60 * 60):
+    """Release abandoned battle locks left by an interrupted local session.
+
+    A battle that has remained unsettled beyond the local-session window cannot
+    still be the current client interaction. Keeping it active blocks unrelated
+    flows such as dating after a reconnect, so retain the record for audit but
+    mark it abandoned before restoring session context.
+    """
+    if not uid:
+        return 0
+    try:
+        age = max(0, int(max_age_seconds))
+    except (TypeError, ValueError):
+        age = 24 * 60 * 60
+    cutoff = max(0, int(time.time()) - age)
+    now = int(time.time())
+    with connect() as connection:
+        cursor = connection.execute(
+            "UPDATE battle_instances SET settled=1,status='abandoned',"
+            "settled_at=?,updated_at=? WHERE uid=? AND settled=0 AND created_at<?",
+            (now, now, uid, cutoff),
+        )
+    return cursor.rowcount
 
 
 def get_latest_battle(uid, map_id=None):
