@@ -28,6 +28,10 @@ import module_rules
 
 
 LOG_DIR = os.environ.get("SOULTIDE_LOG_DIR", os.path.dirname(os.path.abspath(__file__)))
+MOBILE_LOCAL_MODE = os.environ.get("SOULTIDE_MOBILE_MODE") == "1"
+DATING_DIAGNOSTIC_PATH = os.path.join(
+    os.environ.get("SOULTIDE_DATA_ROOT", LOG_DIR), "dating-diagnostic.json"
+)
 OFFLINE_RESPONSE_FIXTURE_PATH = os.environ.get(
     "SOULTIDE_RESPONSE_FIXTURE_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis", "tcp_offline_responses.json"),
@@ -171,6 +175,28 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("tcp_server")
+
+
+def record_dating_diagnostic(uid, soul_id, event_id, outcome, detail=""):
+    """Persist the latest mobile dating outcome for the loopback diagnostic API."""
+    if not MOBILE_LOCAL_MODE:
+        return
+    payload = {
+        "time": int(time.time()),
+        "soulId": int(soul_id or 0),
+        "eventId": int(event_id or 0),
+        "outcome": str(outcome),
+        "detail": str(detail),
+    }
+    try:
+        directory = os.path.dirname(DATING_DIAGNOSTIC_PATH)
+        os.makedirs(directory, exist_ok=True)
+        temporary = DATING_DIAGNOSTIC_PATH + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary, DATING_DIAGNOSTIC_PATH)
+    except OSError:
+        log.warning("  unable to write dating diagnostic uid=%s", uid)
 
 
 # net_user
@@ -1413,10 +1439,82 @@ def seed_local_library(uid):
     return storage.seed_library_state(uid, library)
 
 
+def _library_bool_map(value):
+    """Normalize persisted 0/1 values before encoding map<int|bool> fields."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for raw_key, raw_value in value.items():
+        try:
+            key = int(raw_key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(raw_value, str):
+            result[key] = raw_value.strip().lower() not in ("", "0", "false", "no")
+        else:
+            result[key] = bool(raw_value)
+    return result
+
+
+def _library_int_key_map(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for raw_key, item in value.items():
+        try:
+            result[int(raw_key)] = item
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 def complete_library_state(library):
-    """Project every archive entry declared by the shipped 5392 client."""
+    """Project every archive entry and normalize its wire-level field types."""
     config = LIBRARY_UNLOCK_CONFIG
-    if not isinstance(library, dict) or not config:
+    if not isinstance(library, dict):
+        return library
+
+    # Older imports stored JSON integers for boolean archive flags.  Python's
+    # bool is a distinct protocol type, so normalize both old and new states
+    # before protocol_codec encodes LibraryPOD.
+    for field in ("alienEvent", "newsBook", "rumorPlate", "townStory", "townStoryCG"):
+        library[field] = _library_bool_map(library.get(field))
+    library["alienRewards"] = _library_int_key_map(library.get("alienRewards"))
+    library["equipStar"] = {
+        key: int(value)
+        for key, value in _library_int_key_map(library.get("equipStar")).items()
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool)
+    }
+    library["getNewsBook"] = [int(value) for value in library.get("getNewsBook", []) if str(value).lstrip("-").isdigit()]
+    for field in ("area", "monster", "npc"):
+        entries = _library_int_key_map(library.get(field))
+        library[field] = entries
+        for raw_key, pod in list(entries.items()):
+            if not isinstance(pod, dict):
+                continue
+            pod["entrys"] = [int(value) for value in pod.get("entrys", []) if str(value).lstrip("-").isdigit()]
+            if field in ("area", "npc"):
+                pod["rewards"] = _library_bool_map(pod.get("rewards"))
+            else:
+                pod["rewards"] = _library_bool_map(pod.get("rewards"))
+    alien_rewards = library.get("alienRewards")
+    if isinstance(alien_rewards, dict):
+        for pod in alien_rewards.values():
+            if isinstance(pod, dict):
+                pod["status"] = _library_bool_map(pod.get("status"))
+    souls = library.get("souls")
+    if isinstance(souls, list):
+        for soul in souls:
+            if isinstance(soul, dict):
+                try:
+                    soul["soulCid"] = int(soul.get("soulCid", 0) or 0)
+                except (TypeError, ValueError):
+                    soul["soulCid"] = 0
+                soul["datings"] = [int(value) for value in soul.get("datings", []) if str(value).lstrip("-").isdigit()]
+                soul["newStroys"] = [int(value) for value in soul.get("newStroys", []) if str(value).lstrip("-").isdigit()]
+                soul["unlockPlate"] = _library_bool_map(soul.get("unlockPlate"))
+
+    if not config:
         return library
     for field in ("newsBook", "alienEvent", "townStory", "townStoryCG"):
         values = library.setdefault(field, {})
@@ -6198,18 +6296,42 @@ class Session:
         if self.player_snapshot is not None:
             return True
         if not self.account or REPLAY is None:
+            if MOBILE_LOCAL_MODE and self.account:
+                self.player_snapshot = {"souls": [], "warehouse": []}
+                log.warning(
+                    "  dating continuing without captured player snapshot uid=%s", self.uid
+                )
+                return True
             return False
         captured = REPLAY.body(LOAD_PLAYER_RESULT)
         if captured is None:
+            if MOBILE_LOCAL_MODE:
+                self.player_snapshot = {"souls": [], "warehouse": []}
+                log.warning(
+                    "  dating continuing without replay snapshot uid=%s", self.uid
+                )
+                return True
             log.warning("  dating snapshot unavailable uid=%s", self.uid)
             return False
         try:
             _, _, snapshot = overlay_companion_snapshot(captured, self.uid)
         except Exception:
             log.exception("  dating snapshot initialization failed uid=%s", self.uid)
+            if MOBILE_LOCAL_MODE:
+                self.player_snapshot = {"souls": [], "warehouse": []}
+                log.warning(
+                    "  dating continuing after snapshot overlay failure uid=%s", self.uid
+                )
+                return True
             return False
         if not isinstance(snapshot, dict):
             log.warning("  dating snapshot invalid uid=%s", self.uid)
+            if MOBILE_LOCAL_MODE:
+                self.player_snapshot = {"souls": [], "warehouse": []}
+                log.warning(
+                    "  dating continuing after invalid snapshot uid=%s", self.uid
+                )
+                return True
             return False
         self.player_snapshot = snapshot
         log.info("  dating snapshot initialized lazily uid=%s souls=%d", self.uid, len(snapshot.get("souls", [])))
@@ -6221,6 +6343,7 @@ class Session:
         except ValueError as exc:
             log.warning("  invalid dating body %s: %s", body.hex(), exc)
             return False
+
         def reject(reason):
             # The UI owns a full-screen loading state while waiting for 1503.
             # Always answer a valid request, including local validation failures,
@@ -6237,6 +6360,7 @@ class Session:
                 reason,
                 START_DATING_RESULT,
             )
+            record_dating_diagnostic(self.uid, soul_id, event_id, "rejected", reason)
             return True
 
         if not self.account:
@@ -6255,6 +6379,17 @@ class Session:
                     self.active_story.get("event_id"),
                 )
                 self.active_story = None
+            elif MOBILE_LOCAL_MODE:
+                # A captured account can preserve a stale town, battle, or
+                # story context after the original server disconnects. The
+                # local dating replay has no shared battle lock, so release
+                # that stale client context before opening its real dialog.
+                log.warning(
+                    "  dating cleared stale local story uid=%s kind=%s",
+                    self.uid,
+                    self.active_story.get("kind") if isinstance(self.active_story, dict) else "unknown",
+                )
+                self.active_story = None
             else:
                 return reject("active_story")
         if soul_id <= 0 or event_id <= 0:
@@ -6263,21 +6398,30 @@ class Session:
         companion = storage.get_companion(self.uid, soul_id)
         if not event or not companion or event.get("SoulId") != soul_id:
             return reject("unknown_event")
-        if companion["favor_level"] < int(event.get("UnlockLevel") or 1):
+        dialog_cid = int(event.get("Dialog") or 0)
+        if not dialog_cid:
+            return reject("missing_dialog")
+        if not MOBILE_LOCAL_MODE and companion["favor_level"] < int(event.get("UnlockLevel") or 1):
             return reject("favor_level")
         predecessor = event.get("NeedDownDatingId")
-        if predecessor and not storage.has_dating_record(self.uid, soul_id, predecessor):
+        if (
+            not MOBILE_LOCAL_MODE
+            and predecessor
+            and not storage.has_dating_record(self.uid, soul_id, predecessor)
+        ):
             return reject("predecessor")
         costs = list(zip(event.get("Cost", [])[::2], event.get("Cost", [])[1::2]))
         inventory = {row["template_id"]: row["quantity"] for row in storage.get_items(self.uid)}
-        if any(inventory.get(cid, 0) < quantity for cid, quantity in costs):
+        if not MOBILE_LOCAL_MODE and any(inventory.get(cid, 0) < quantity for cid, quantity in costs):
             return reject("cost")
+        settlement_costs = [] if MOBILE_LOCAL_MODE else costs
         self.active_story = {
             "kind": "dating",
             "soul_id": soul_id,
             "event_id": event_id,
-            "dialog_cid": int(event["Dialog"]),
+            "dialog_cid": dialog_cid,
             "event": event,
+            "settlement_costs": settlement_costs,
             "begin_favor": int(companion["favor"]),
             "begin_favor_level": int(companion["favor_level"]),
         }
@@ -6285,13 +6429,20 @@ class Session:
             START_DATING_RESULT,
             protocol_codec.encode_method(START_DATING_RESULT, 0, soul_id, event_id),
         )
-        self.send(NOTIFY_OPEN_DIALOG, protocol_codec.encode_method(NOTIFY_OPEN_DIALOG, int(event["Dialog"])))
+        self.send(NOTIFY_OPEN_DIALOG, protocol_codec.encode_method(NOTIFY_OPEN_DIALOG, dialog_cid))
+        record_dating_diagnostic(
+            self.uid,
+            soul_id,
+            event_id,
+            "opened",
+            "local_compat" if MOBILE_LOCAL_MODE else "validated",
+        )
         log.info(
             "  dating opened uid=%s soulCid=%d eventCid=%d dialogCid=%d -> %d/%d",
             self.uid,
             soul_id,
             event_id,
-            event["Dialog"],
+            dialog_cid,
             START_DATING_RESULT,
             NOTIFY_OPEN_DIALOG,
         )
@@ -6304,8 +6455,7 @@ class Session:
         rewards = list(zip(reward_values[::2], reward_values[1::2]))
         favor_delta = sum(quantity for cid, quantity in rewards if 10600 < cid < 10700)
         item_rewards = [(cid, quantity) for cid, quantity in rewards if not 10600 < cid < 10700]
-        cost_values = event.get("Cost", [])
-        costs = list(zip(cost_values[::2], cost_values[1::2]))
+        costs = list(dating.get("settlement_costs", ()))
         end_favor = dating["begin_favor"] + favor_delta
         local_companion = storage.get_companion(self.uid, dating["soul_id"])
         end_level = favor_level_for(
@@ -6323,6 +6473,9 @@ class Session:
             end_level,
         ):
             log.warning("  dating settlement transaction rejected uid=%s eventCid=%d", self.uid, dating["event_id"])
+            record_dating_diagnostic(
+                self.uid, dating["soul_id"], dating["event_id"], "settlement_rejected"
+            )
             self.send(
                 SELECT_DIALOG_RESULT,
                 protocol_codec.encode_method(SELECT_DIALOG_RESULT, 1, -1),
@@ -6341,12 +6494,24 @@ class Session:
                 changed_items.append(item_pod)
         if changed_items:
             self.send(NOTIFY_ITEM_CHANGE, protocol_codec.encode_method(NOTIFY_ITEM_CHANGE, changed_items))
-        soul_pod = next(
-            pod for pod in self.player_snapshot["souls"] if pod.get("cid") == dating["soul_id"]
-        )
         local = storage.get_companion(self.uid, dating["soul_id"])
-        soul_pod.update({"favor": local["favor"], "favorLv": local["favor_level"]})
-        self.send(UPDATE_SOUL, protocol_codec.encode_method(UPDATE_SOUL, soul_pod))
+        soul_pod = next(
+            (
+                pod
+                for pod in self.player_snapshot.get("souls", [])
+                if pod.get("cid") == dating["soul_id"]
+            ),
+            None,
+        )
+        if soul_pod is not None:
+            soul_pod.update({"favor": local["favor"], "favorLv": local["favor_level"]})
+            self.send(UPDATE_SOUL, protocol_codec.encode_method(UPDATE_SOUL, soul_pod))
+        else:
+            log.warning(
+                "  dating settlement skipped incomplete soul refresh uid=%s soulCid=%d",
+                self.uid,
+                dating["soul_id"],
+            )
         records = storage.get_dating_records(self.uid, dating["soul_id"])
         self.send(NOTIFY_DATING, protocol_codec.encode_method(NOTIFY_DATING, dating["soul_id"], records))
         show_items = [{"cid": cid, "num": quantity, "tag": 0} for cid, quantity in item_rewards]
@@ -6375,6 +6540,7 @@ class Session:
             NOTIFY_DATING,
             NOTIFY_DATING_END,
         )
+        record_dating_diagnostic(self.uid, dating["soul_id"], dating["event_id"], "completed")
         self.active_story = None
         return True
 

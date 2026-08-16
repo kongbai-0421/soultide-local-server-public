@@ -16,7 +16,11 @@ from pathlib import Path
 ROOT = Path(os.environ.get("SOULTIDE_ROOT", Path(__file__).resolve().parent)).resolve()
 DB_PATH = Path(os.environ.get("SOULTIDE_DB_PATH", ROOT / "soultide.db"))
 DEFAULT_ROLE_ID = "5056536390159161419"
-DEFAULT_ROLE_NAME = "x空白x"
+DEFAULT_ROLE_NAME = "人偶师"
+# ``x空白x`` is a valid user-chosen role name in this project.  Do not
+# silently rewrite it during every database startup; bootstrap account
+# migration is handled explicitly by the mobile host instead.
+LEGACY_PLACEHOLDER_ROLE_NAMES = ()
 DEFAULT_ROLE_LEVEL = 70
 
 # The real Bilibili channel identity observed on the preserved MuMu account must
@@ -354,6 +358,13 @@ def initialize():
         ):
             if name not in player_columns:
                 connection.execute(f"ALTER TABLE players ADD COLUMN {name} {definition}")
+        # Repair only genuinely missing names. ``x空白x`` is user data and must
+        # survive upgrades and repeated startup.
+        connection.execute(
+            "UPDATE players SET role_name=? "
+            "WHERE role_name IS NULL OR TRIM(role_name)=''",
+            (DEFAULT_ROLE_NAME,),
+        )
 
 
 def _guild_decode(row):

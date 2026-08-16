@@ -13,7 +13,7 @@ from logging.handlers import RotatingFileHandler
 
 ROOT = os.environ.get("SOULTIDE_ROOT", os.path.dirname(os.path.abspath(__file__)))
 LOCAL_UID = os.environ.get("SOULTIDE_LOCAL_UID", "local_uid_12345")
-LOCAL_USERNAME = os.environ.get("SOULTIDE_LOCAL_USERNAME", "local_player")
+LOCAL_USERNAME = os.environ.get("SOULTIDE_LOCAL_USERNAME", "人偶师")
 LOCAL_TOKEN = "local_token_" + hashlib.md5(LOCAL_UID.encode("ascii")).hexdigest()
 SERVER_IP = os.environ.get(
     "SOULTIDE_SERVER_IP",

@@ -28,6 +28,15 @@ ASSET_ROOT = Path(
         str(ROOT / "offline_cdn" / "Android"),
     )
 )
+# In the single-APK build the full media mirror stays with the game external
+# resources. Keep the private mirror as a fallback, but do not duplicate
+# several GiB of video into app-private storage.
+GAME_ASSET_ROOT = Path(
+    os.environ.get(
+        "SOULTIDE_GAME_ASSET_ROOT",
+        str(ASSET_ROOT),
+    )
+)
 _configured_manifest = os.environ.get("SOULTIDE_LOCAL_MANIFEST", "").strip()
 BUNDLED_MANIFEST = ROOT / "version-local-default.json"
 if _configured_manifest:
@@ -68,6 +77,9 @@ CDN_UPSTREAM_ROOT = os.environ.get(
     "SOULTIDE_CDN_UPSTREAM_ROOT",
     "http://cdn-onigao-1.iqigame.com/Onigao/Update/resources",
 ).rstrip("/")
+MOBILE_LOCAL_MODE = os.environ.get("SOULTIDE_MOBILE_MODE") == "1"
+LOCAL_CHANNEL_UID = os.environ.get("SOULTIDE_LOCAL_UID", "local-test-dollmaster")
+LOCAL_USERNAME = os.environ.get("SOULTIDE_LOCAL_USERNAME", "人偶师")
 UPDATE_MODE_PATH = ROOT / "update_mode.json"
 VERSION_UPSTREAM_URL = os.environ.get(
     "SOULTIDE_VERSION_UPSTREAM_URL",
@@ -450,15 +462,16 @@ async def get_notice(request: Request):
 @app.post("/login/user_login/")
 async def user_login(request: Request):
     body_text = (await request.body()).decode("utf-8", errors="replace")
-    channel_uid = "local_uid_12345"
-    username = "local_player"
+    channel_uid = LOCAL_CHANNEL_UID
+    username = LOCAL_USERNAME
     channel_id = "46"
     try:
         data = json.loads(unquote(body_text))
         inner = data.get("data", {})
-        channel_uid = str(inner.get("cUid") or inner.get("channel_uid") or channel_uid)
-        username = str(inner.get("cName") or inner.get("channel_username") or username)
-        channel_id = str(inner.get("channel_id") or channel_id)
+        if not MOBILE_LOCAL_MODE:
+            channel_uid = str(inner.get("cUid") or inner.get("channel_uid") or channel_uid)
+            username = str(inner.get("cName") or inner.get("channel_username") or username)
+            channel_id = str(inner.get("channel_id") or channel_id)
         log.info(
             "user_login channel=%s(%s) user=%s",
             inner.get("channel_name"),
@@ -595,24 +608,33 @@ async def create_recharge_order(request: Request):
     })
 
 
+def _local_media_candidate(relative: Path) -> Path | None:
+    """Find a requested video in the game pack before the private mirror."""
+    if relative.is_absolute() or ".." in relative.parts:
+        return None
+    for root in (GAME_ASSET_ROOT, ASSET_ROOT):
+        resolved_root = root.resolve()
+        for prefix in (Path(), Path("21_Media") / "CG", Path("21_Media")):
+            candidate = (root / prefix / relative).resolve()
+            try:
+                candidate.relative_to(resolved_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 @app.api_route("/Onigao/Media/{media_path:path}", methods=["GET", "HEAD"])
 async def local_media(media_path: str, request: Request):
-    """Serve legacy MediaUrl paths from the same external resource root."""
+    """Serve legacy MediaUrl paths from game external resources or the mirror."""
     relative = Path(unquote(media_path.replace("\\", "/")))
-    candidates = [
-        ASSET_ROOT / relative,
-        ASSET_ROOT / "21_Media" / "CG" / relative,
-        ASSET_ROOT / "21_Media" / relative,
-    ]
-    root = ASSET_ROOT.resolve()
-    candidate = next((path.resolve() for path in candidates if path.exists()), None)
-    if candidate is None or not candidate.is_file():
+    if relative.is_absolute() or ".." in relative.parts:
+        return JSONResponse({"code": 403, "msg": "invalid path"}, status_code=403)
+    candidate = _local_media_candidate(relative)
+    if candidate is None:
         log.warning("media missing: %s", relative.as_posix())
         return JSONResponse({"code": 404, "msg": "media not found"}, status_code=404)
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return JSONResponse({"code": 403, "msg": "invalid path"}, status_code=403)
     content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
     range_header = request.headers.get("range")
     if range_header and request.method == "GET":
